@@ -1,29 +1,7 @@
 require('dotenv').config()
 
-const http = require('http')
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
-
-const PHONE_NUMBER = process.env.PHONE_NUMBER || ''
-const PORT = process.env.PORT || 3000
-
-// Si un volume Railway est monté, on y stocke la session pour qu'elle survive aux redéploiements
-const AUTH_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
-  ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/auth_info`
-  : (process.env.AUTH_DIR || 'auth_info')
-
-let botStatus = 'starting'
-let lastPairingCode = null
-
-// Petit serveur HTTP pour le healthcheck Railway et le suivi du statut
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json' })
-  res.end(JSON.stringify({
-    bot: 'Telopex WhatsApp Bot',
-    status: botStatus,
-    pairingCode: botStatus === 'pairing' ? lastPairingCode : undefined,
-  }))
-}).listen(PORT, () => console.log(`🌐 Healthcheck sur le port ${PORT}`))
 
 const GEMINI_KEY = process.env.GEMINI_KEY || ''
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_KEY}`
@@ -70,91 +48,32 @@ async function askGemini(userId, text) {
   return reply
 }
 
-async function requestPairingCodeWithRetry(sock, phoneNumber, attempt = 1) {
-  await new Promise((resolve) => setTimeout(resolve, 2000))
-  try {
-    const code = await sock.requestPairingCode(phoneNumber)
-    botStatus = 'pairing'
-    lastPairingCode = code
-    console.log(`🔑 Code de pairage : ${code}`)
-    console.log('➡️  Sur votre téléphone : WhatsApp > Paramètres > Appareils connectés > Connecter un appareil > Connecter avec un numéro de téléphone, puis entrez ce code dans les ~60 secondes.')
-  } catch (err) {
-    if (attempt < 6) {
-      console.log(`⏳ Connexion en cours... nouvelle tentative (${attempt}/5)`)
-      await requestPairingCodeWithRetry(sock, phoneNumber, attempt + 1)
-    } else {
-      console.error('❌ Impossible d\'obtenir le code de pairage :', err.message || err)
-    }
-  }
-}
-
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-
-  let phoneNumber = null
-  if (!state.creds.registered) {
-    if (!PHONE_NUMBER) {
-      console.error('❌ Aucune session existante et la variable d\'environnement PHONE_NUMBER n\'est pas définie.')
-      console.error('   Définis PHONE_NUMBER (ex: 2250102030405, sans + ni espaces) pour générer un code de pairage.')
-      return
-    }
-    phoneNumber = PHONE_NUMBER.trim()
-  }
-
-  const { version } = await fetchLatestBaileysVersion()
-  console.log(`📦 Version Baileys/WA utilisée : ${version.join('.')}`)
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
 
   const sock = makeWASocket({
     auth: state,
-    version,
-    browser: Browsers.ubuntu('Chrome'),
+    printQRInTerminal: true,
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  if (phoneNumber) {
-    requestPairingCodeWithRetry(sock, phoneNumber)
-  }
-
-  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+  sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (connection === 'close') {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut
-      // Pendant le pairing, un "loggedOut" (401) signifie juste que le code a expiré :
-      // on relance pour en générer un nouveau, tant que le compte n'a jamais été lié.
-      const wasNeverPaired = !state.creds.registered
-      const shouldReconnect = !isLoggedOut || wasNeverPaired
-
-      if (isLoggedOut && wasNeverPaired) {
-        botStatus = 'pairing'
-        console.log('⏳ Code de pairage expiré, génération d\'un nouveau code...')
-      } else {
-        botStatus = shouldReconnect ? 'reconnecting' : 'logged_out'
-        console.log('Connexion fermée. Reconnexion :', shouldReconnect)
-      }
-
-      if (shouldReconnect) setTimeout(() => startBot(), 2000)
+      const shouldReconnect = new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
+      console.log('Connexion fermée. Reconnexion :', shouldReconnect)
+      if (shouldReconnect) startBot()
     } else if (connection === 'open') {
-      botStatus = 'connected'
-      lastPairingCode = null
       console.log('✅ Telopex Bot WhatsApp connecté !')
-    } else if (connection === 'connecting') {
-      botStatus = 'connecting'
     }
   })
 
-  const startTimestamp = Math.floor(Date.now() / 1000)
-
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify' && type !== 'append') return
+    if (type !== 'notify') return
 
     for (const msg of messages) {
       if (msg.key.fromMe) continue
       if (!msg.message) continue
-
-      const ts = Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0)
-      // Ignore les messages reçus plus d'1 minute avant le démarrage du bot (évite de répondre à tout l'historique)
-      if (ts < startTimestamp - 60) continue
 
       const from    = msg.key.remoteJid
       const text    = msg.message.conversation
