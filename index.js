@@ -118,10 +118,22 @@ async function startBot() {
 
   sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     if (connection === 'close') {
-      const shouldReconnect = new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
-      botStatus = shouldReconnect ? 'reconnecting' : 'logged_out'
-      console.log('Connexion fermée. Reconnexion :', shouldReconnect)
-      if (shouldReconnect) startBot()
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut
+      // Pendant le pairing, un "loggedOut" (401) signifie juste que le code a expiré :
+      // on relance pour en générer un nouveau, tant que le compte n'a jamais été lié.
+      const wasNeverPaired = !state.creds.registered
+      const shouldReconnect = !isLoggedOut || wasNeverPaired
+
+      if (isLoggedOut && wasNeverPaired) {
+        botStatus = 'pairing'
+        console.log('⏳ Code de pairage expiré, génération d\'un nouveau code...')
+      } else {
+        botStatus = shouldReconnect ? 'reconnecting' : 'logged_out'
+        console.log('Connexion fermée. Reconnexion :', shouldReconnect)
+      }
+
+      if (shouldReconnect) setTimeout(() => startBot(), 2000)
     } else if (connection === 'open') {
       botStatus = 'connected'
       lastPairingCode = null
